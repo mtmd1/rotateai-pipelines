@@ -6,7 +6,7 @@ into model_data.inc and model_params.h for use by pipelines.
 inputs:
     --model   path to .keras file
     --params  path to .pkl file
-    --out     output directory (default: build/generated/)
+    --out     output directory (default: build/models/)
 
 steps:
     1. load .keras model
@@ -21,8 +21,8 @@ steps:
         OUTPUT_MEANS[], OUTPUT_STDS[]
 
 outputs:
-    build/generated/model_data.inc
-    build/generated/model_params.h
+    build/models/model_data.inc
+    build/models/model_params.h
 
 Created: 2026-03-10
 Authors: Maxence Morel Dierckx, Claude Opus 4.6
@@ -30,10 +30,53 @@ Authors: Maxence Morel Dierckx, Claude Opus 4.6
 import argparse
 import os
 import pickle
+import re
 import sys
 
 import numpy as np
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 import tensorflow as tf
+from tensorflow.lite.tools import visualize
+
+
+def parse_op_name(word):
+    """Convert flatbuffer op name to resolver method name.
+
+    e.g. CONV_2D → AddConv2D, MAX_POOL_2D → AddMaxPool2D.
+    Lifted from tflite-micro generate_micro_mutable_op_resolver_from_model.py.
+    """
+    word = word.replace('TFLite', '')
+    parts = re.split('_|-', word)
+    result = ''
+    for part in parts:
+        if len(part) > 1:
+            if part[0].isalpha():
+                result += part[0].upper() + part[1:].lower()
+            else:
+                result += part.upper()
+        else:
+            result += part.upper()
+    result = result.replace('Lstm', 'LSTM')
+    result = result.replace('BatchMatmul', 'BatchMatMul')
+    return 'Add' + result
+
+
+def extract_ops(tflite_bytes):
+    """Extract operator names from a .tflite flatbuffer.
+
+    Returns sorted list of (op_name, method_name) tuples.
+    Warns on unknown/custom ops.
+    """
+    data = visualize.CreateDictFromFlatbuffer(bytearray(tflite_bytes))
+    ops = set()
+    for op_code in data['operator_codes']:
+        if op_code['custom_code'] is not None:
+            name = visualize.NameListToString(op_code['custom_code'])
+            print(f'warning: custom op "{name}", skipping', file=sys.stderr)
+            continue
+        code = max(op_code['builtin_code'], op_code['deprecated_builtin_code'])
+        ops.add(visualize.BuiltinCodeToName(code))
+    return sorted((op, parse_op_name(op)) for op in ops)
 
 
 def load_params(path):
@@ -74,7 +117,7 @@ def format_float_array(arr):
 
 
 def write_model_params_h(path, window_size, input_means, input_stds,
-                         output_means, output_stds):
+                         output_means, output_stds, ops):
     input_channels = len(input_means)
     output_channels = len(output_means)
     with open(path, 'w') as f:
@@ -82,7 +125,14 @@ def write_model_params_h(path, window_size, input_means, input_stds,
         f.write('#define MODEL_PARAMS_H\n\n')
         f.write(f'#define WINDOW_SIZE {window_size}\n')
         f.write(f'#define INPUT_CHANNELS {input_channels}\n')
-        f.write(f'#define OUTPUT_CHANNELS {output_channels}\n\n')
+        f.write(f'#define OUTPUT_CHANNELS {output_channels}\n')
+        f.write(f'#define NUM_OPS {len(ops)}\n\n')
+        # REGISTER_OPS macro
+        f.write('#define REGISTER_OPS(resolver) \\\n')
+        for i, (_, method) in enumerate(ops):
+            slash = ' \\' if i < len(ops) - 1 else ''
+            f.write(f'    resolver.{method}();{slash}\n')
+        f.write('\n')
         f.write(f'static const float INPUT_MEANS[] = {{{format_float_array(input_means)}}};\n')
         f.write(f'static const float INPUT_STDS[] = {{{format_float_array(input_stds)}}};\n')
         f.write(f'static const float OUTPUT_MEANS[] = {{{format_float_array(output_means)}}};\n')
@@ -94,7 +144,7 @@ def main():
     parser = argparse.ArgumentParser(description='Convert Keras model to C-compatible files')
     parser.add_argument('--model', required=True, help='Path to .keras file')
     parser.add_argument('--params', required=True, help='Path to .pkl file')
-    parser.add_argument('--out', default='build/generated/', help='Output directory')
+    parser.add_argument('--out', default='build/models/', help='Output directory')
     args = parser.parse_args()
 
     try:
@@ -111,7 +161,11 @@ def main():
         tflite_bytes = convert_to_tflite(model, input_channels, window_size)
         print(f'Converted to TFLite ({len(tflite_bytes)} bytes)')
 
-        # Step 3: Write outputs
+        # Step 3: Extract ops from .tflite
+        ops = extract_ops(tflite_bytes)
+        print(f'Extracted {len(ops)} ops: {", ".join(m for _, m in ops)}')
+
+        # Step 4: Write outputs
         os.makedirs(args.out, exist_ok=True)
 
         inc_path = os.path.join(args.out, 'model_data.inc')
@@ -120,7 +174,7 @@ def main():
 
         params_path = os.path.join(args.out, 'model_params.h')
         write_model_params_h(params_path, window_size, means, stds,
-                             means_label, stds_label)
+                             means_label, stds_label, ops)
         print(f'Wrote {params_path}')
 
     except Exception as e:

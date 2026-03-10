@@ -1,7 +1,108 @@
 /*
-* src/pipeline.h
-* Maximal accuracy/cost baseline, full inference every sample.
-* 
-* Created: 2026-03-10
-* Authors: Maxence Morel Dierckx, Claude Opus 4.6
-*/
+ * src/pipeline.h
+ * Shared interface for RotateAI inference pipelines.
+ *
+ * Provides model loading, op registration, z-score normalization,
+ * and binary protocol I/O. Pipelines include this and write their
+ * own main loop.
+ *
+ * Created: 2026-03-10
+ * Authors: Maxence Morel Dierckx, Claude Opus 4.6
+ */
+
+#ifndef PIPELINE_H
+#define PIPELINE_H
+
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+#include "model_params.h"
+
+// Model data embedded at compile time.
+const unsigned char model_data[] = {
+#include "model_data.inc"
+};
+
+// Arena.
+constexpr int kArenaSize = 256 * 1024;
+alignas(16) uint8_t tensor_arena[kArenaSize];
+
+// Pipeline state returned by pipeline_init.
+struct Pipeline {
+    tflite::MicroInterpreter* interpreter;
+    float* input;
+    float* output;
+};
+
+// Initialize model, register ops, allocate tensors.
+// Returns Pipeline with pointers to input/output tensors.
+// Exits on failure. No recovery on embedded.
+inline Pipeline pipeline_init() {
+    const tflite::Model* model = tflite::GetModel(model_data);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        fprintf(stderr, "error: model version %lu != %d\n",
+                model->version(), TFLITE_SCHEMA_VERSION);
+        exit(1);
+    }
+
+    static tflite::MicroMutableOpResolver<NUM_OPS> resolver;
+    REGISTER_OPS(resolver);
+
+    static tflite::MicroInterpreter interp(model, resolver, tensor_arena, kArenaSize);
+    if (interp.AllocateTensors() != kTfLiteOk) {
+        fprintf(stderr, "error: AllocateTensors failed\n");
+        exit(1);
+    }
+
+    TfLiteTensor* input = interp.input(0);
+    TfLiteTensor* output = interp.output(0);
+    if (!input || !output || !input->data.f || !output->data.f) {
+        fprintf(stderr, "error: tensor allocation failed\n");
+        exit(1);
+    }
+
+    return {&interp, input->data.f, output->data.f};
+}
+
+// Run inference. Returns 0 on success, 1 on failure.
+inline int pipeline_invoke(Pipeline* p) {
+    return p->interpreter->Invoke() != kTfLiteOk;
+}
+
+// Z-score normalization.
+inline void normalize(float* sample, const float* means, const float* stds, int n) {
+    for (int i = 0; i < n; i++)
+        sample[i] = (sample[i] - means[i]) / stds[i];
+}
+
+inline void denormalize(float* sample, const float* means, const float* stds, int n) {
+    for (int i = 0; i < n; i++)
+        sample[i] = sample[i] * stds[i] + means[i];
+}
+
+// Read one sample from stdin. Returns 1 on success, 0 on EOF.
+inline int read_sample(float* sample, int n) {
+    return fread(sample, sizeof(float), n, stdin) == (size_t)n;
+}
+
+// Write flag 0x01 followed by output floats, then flush.
+inline void write_output(const float* sample, int n) {
+    uint8_t flag = 0x01;
+    fwrite(&flag, 1, 1, stdout);
+    fwrite(sample, sizeof(float), n, stdout);
+    fflush(stdout);
+}
+
+// Write flag 0x00 (no output), then flush.
+inline void write_skip(void) {
+    uint8_t flag = 0x00;
+    fwrite(&flag, 1, 1, stdout);
+    fflush(stdout);
+}
+
+#endif
