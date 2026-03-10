@@ -11,7 +11,7 @@ Requires [TFLite Micro](https://github.com/tensorflow/tflite-micro) built for yo
 ```sh
 make baseline
 make variable
-make multi
+make multiple
 make surface
 ```
 
@@ -21,8 +21,5 @@ make surface
 | -------- | -------- | ----------- |
 | `baseline` | Every sample | Maximum accuracy and cost. |
 | `variable` | Every X samples | Measures a sample window periodically. |
-| `multi`    | Batched windows | Accumulates multiple windows and runs them together. Reduces duty cycle. |
+| `multiple` | Batched windows | Accumulates multiple windows and runs them together. Reduces duty cycle. |
 | `surface`  | Event-triggered | Detects surfacing periods and runs inference on them. |
-
-Some pipelines, like `surface`, include other pipelines as modules.
-
