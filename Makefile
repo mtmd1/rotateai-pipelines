@@ -19,6 +19,11 @@ build/baseline: src/baseline.cc src/pipeline.h $(GEN_DIR)/model_data.inc $(TFLM_
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) src/baseline.cc -o $@ $(TFLM_LIB)
 
+variable: build/variable
+build/variable: src/variable.cc src/pipeline.h $(GEN_DIR)/model_data.inc $(TFLM_LIB)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) src/variable.cc -o $@ $(TFLM_LIB)
+
 # TFLite Micro static library
 $(TFLM_LIB):
 	make -C $(TFLM_DIR) -f tensorflow/lite/micro/tools/make/Makefile TARGET=linux microlite
@@ -26,4 +31,4 @@ $(TFLM_LIB):
 clean:
 	rm -rf build/
 
-.PHONY: baseline clean
+.PHONY: baseline variable clean
