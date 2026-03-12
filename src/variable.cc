@@ -9,9 +9,9 @@
 
 #include "pipeline.h"
 
-static void print_usage(const char *prog)
+static void print_usage()
 {
-    fprintf(stderr, "Usage: %s --offset X", prog);
+    fprintf(stderr, "Usage: variable --offset X");
 }
 
 int main(int argc, const char *argv[]) 
@@ -23,13 +23,13 @@ int main(int argc, const char *argv[])
         if ((strcmp(argv[i], "--offset") == 0 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
             offset = atoi(argv[++i]);
         } else {
-            print_usage(argv[0]);
+            print_usage();
             return 1;
         }
     }
 
     if (offset == 0) {
-        print_usage(argv[0]);
+        print_usage();
         fprintf(stderr, "Offset must be >= 1.")
         return 1;
     }

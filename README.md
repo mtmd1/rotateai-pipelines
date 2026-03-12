@@ -34,7 +34,6 @@ See `python tools/prepare_model.py --help` for all options.
 ```sh
 make baseline
 make variable
-make multiple
 make surface
 ```
 
@@ -44,5 +43,4 @@ make surface
 | -------- | -------- | ----------- |
 | `baseline` | Every sample | Maximum accuracy and cost. |
 | `variable` | Every X samples | Measures a sample window periodically. |
-| `multiple` | Batched windows | Accumulates multiple windows and runs them together. |
 | `surface`  | Event-triggered | Detects surfacing periods and runs inference on them. |

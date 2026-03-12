@@ -1,0 +1,336 @@
+/*
+ * src/surface.cc
+ * Detects surfacing periods and runs inference
+ * on them with four possible strategies.
+ *
+ * Usage: surface --strategy start/end/bookend/average \
+ *   --surface-depth 2 --dive-depth 10 --min-samples 600
+ *
+ * Strategies:
+ *   - start    single window beginning with first sample of the surfacing period
+ *   - end      single window ending with last sample of the surfacing period
+ *   - bookend  average of the start and end window (outputted at the end)
+ *   - average  average of N windows tiled to cover the surfacing period
+ *              (anchored to the end, start window overlaps pre-surface data)
+ *
+ * Created: 2026-03-10
+ * Authors: Maxence Morel Dierckx, Claude Opus 4.6
+ */
+
+#include "pipeline.h"
+
+static void print_usage()
+{
+    fprintf(stderr, "Usage: surface --strategy STRAT --surface-depth DEPTH --dive-depth DEPTH [--min-samples INT]\n");
+}
+
+// Run inference on window, denormalize last row into result.
+// Returns 0 on success, 1 on failure.
+static int infer(Pipeline* p, float* window, int kInputSize, int kOutputSize,
+                 float* result)
+{
+    memcpy(p->input, window, sizeof(float) * kInputSize);
+    if (pipeline_invoke(p)) {
+        fprintf(stderr, "error: inference failed\n");
+        return 1;
+    }
+
+    memcpy(result, p->output + kOutputSize - OUTPUT_CHANNELS,
+           sizeof(float) * OUTPUT_CHANNELS);
+    denormalize(result, OUTPUT_MEANS, OUTPUT_STDS, OUTPUT_CHANNELS);
+    return 0;
+}
+
+// Invoke model on current window, denormalize, and write output.
+static int infer_and_write(Pipeline* p, float* window, int kInputSize, int kOutputSize)
+{
+    float result[OUTPUT_CHANNELS];
+    if (infer(p, window, kInputSize, kOutputSize, result))
+        return 1;
+    write_output(result, OUTPUT_CHANNELS);
+    return 0;
+}
+
+// Shift window left and insert sample at end.
+static void advance_window(float* window, float* sample, int kInputSize)
+{
+    memmove(window, window + INPUT_CHANNELS,
+            sizeof(float) * (kInputSize - INPUT_CHANNELS));
+    memcpy(window + kInputSize - INPUT_CHANNELS, sample,
+           sizeof(float) * INPUT_CHANNELS);
+}
+
+// Strategy: start - freeze window after first WINDOW_SIZE surface samples.
+static int run_start(Pipeline* p, int surface_depth, int dive_depth, int min_samples)
+{
+    constexpr int kInputSize = WINDOW_SIZE * INPUT_CHANNELS;
+    constexpr int kOutputSize = WINDOW_SIZE * OUTPUT_CHANNELS;
+
+    float window[kInputSize] = {0};
+    float sample[INPUT_CHANNELS];
+
+    bool surfacing = false;
+    int surface_count = 0;
+
+    while (read_sample(sample, INPUT_CHANNELS)) {
+        float depth = sample[INPUT_CHANNELS - 1];
+
+        normalize(sample, INPUT_MEANS, INPUT_STDS, INPUT_CHANNELS);
+
+        if (!surfacing && depth <= surface_depth) {
+            // Rising edge
+            surfacing = true;
+            surface_count = 0;
+        }
+
+        if (surfacing) {
+            // Advance window only until full for start
+            if (surface_count < WINDOW_SIZE) {
+                advance_window(window, sample, kInputSize);
+            }
+            surface_count++;
+
+            if (depth > dive_depth) {
+                // Falling edge
+                surfacing = false;
+
+                if (surface_count >= min_samples) {
+                    if (infer_and_write(p, window, kInputSize, kOutputSize))
+                        return 1;
+                    continue;
+                }
+            }
+        }
+
+        write_skip();
+    }
+
+    return 0;
+}
+
+// Strategy: end - keep advancing window until falling edge.
+static int run_end(Pipeline* p, int surface_depth, int dive_depth, int min_samples)
+{
+    constexpr int kInputSize = WINDOW_SIZE * INPUT_CHANNELS;
+    constexpr int kOutputSize = WINDOW_SIZE * OUTPUT_CHANNELS;
+
+    float window[kInputSize] = {0};
+    float sample[INPUT_CHANNELS];
+
+    bool surfacing = false;
+    int surface_count = 0;
+
+    while (read_sample(sample, INPUT_CHANNELS)) {
+        float depth = sample[INPUT_CHANNELS - 1];
+
+        normalize(sample, INPUT_MEANS, INPUT_STDS, INPUT_CHANNELS);
+
+        if (!surfacing && depth <= surface_depth) {
+            // Rising edge
+            surfacing = true;
+            surface_count = 0;
+        }
+
+        if (surfacing) {
+            // Advance window: always for end, only until full for start
+            advance_window(window, sample, kInputSize);
+            surface_count++;
+
+            if (depth > dive_depth) {
+                // Falling edge
+                surfacing = false;
+
+                if (surface_count >= min_samples) {
+                    if (infer_and_write(p, window, kInputSize, kOutputSize))
+                        return 1;
+                    continue;
+                }
+            }
+        }
+
+        write_skip();
+    }
+
+    return 0;
+}
+
+// Strategy: bookend - average of start and end windows.
+static int run_bookend(Pipeline* p,
+                       int surface_depth, int dive_depth, int min_samples)
+{
+    constexpr int kInputSize = WINDOW_SIZE * INPUT_CHANNELS;
+    constexpr int kOutputSize = WINDOW_SIZE * OUTPUT_CHANNELS;
+
+    float start_window[kInputSize] = {0};
+    float end_window[kInputSize] = {0};
+    float sample[INPUT_CHANNELS];
+
+    bool surfacing = false;
+    int surface_count = 0;
+
+    while (read_sample(sample, INPUT_CHANNELS)) {
+        float depth = sample[INPUT_CHANNELS - 1];
+
+        normalize(sample, INPUT_MEANS, INPUT_STDS, INPUT_CHANNELS);
+
+        if (!surfacing && depth <= surface_depth) {
+            // Rising edge
+            surfacing = true;
+            surface_count = 0;
+        }
+
+        if (surfacing) {
+            // Start window: advance only until full
+            if (surface_count < WINDOW_SIZE) {
+                advance_window(start_window, sample, kInputSize);
+            }
+            // End window: always advance
+            advance_window(end_window, sample, kInputSize);
+            surface_count++;
+
+            if (depth > dive_depth) {
+                // Falling edge
+                surfacing = false;
+
+                if (surface_count >= min_samples) {
+                    float result_start[OUTPUT_CHANNELS];
+                    float result_end[OUTPUT_CHANNELS];
+                    if (infer(p, start_window, kInputSize, kOutputSize, result_start))
+                        return 1;
+                    if (infer(p, end_window, kInputSize, kOutputSize, result_end))
+                        return 1;
+
+                    float averaged[OUTPUT_CHANNELS];
+                    for (int i = 0; i < OUTPUT_CHANNELS; i++)
+                        averaged[i] = (result_start[i] + result_end[i]) * 0.5f;
+
+                    write_output(averaged, OUTPUT_CHANNELS);
+                    continue;
+                }
+            }
+        }
+
+        write_skip();
+    }
+
+    return 0;
+}
+
+// Strategy: average - average of non-overlapping windows across surfacing period.
+static int run_average(Pipeline* p,
+                       int surface_depth, int dive_depth, int min_samples)
+{
+    constexpr int kInputSize = WINDOW_SIZE * INPUT_CHANNELS;
+    constexpr int kOutputSize = WINDOW_SIZE * OUTPUT_CHANNELS;
+
+    float window[kInputSize] = {0};
+    float accum[OUTPUT_CHANNELS] = {0};
+    float sample[INPUT_CHANNELS];
+
+    bool surfacing = false;
+    int surface_count = 0;
+    int window_pos = 0;   // samples in current window
+    int window_count = 0; // completed windows
+
+    while (read_sample(sample, INPUT_CHANNELS)) {
+        float depth = sample[INPUT_CHANNELS - 1];
+
+        normalize(sample, INPUT_MEANS, INPUT_STDS, INPUT_CHANNELS);
+
+        if (!surfacing && depth <= surface_depth) {
+            // Rising edge
+            surfacing = true;
+            surface_count = 0;
+            window_pos = 0;
+            window_count = 0;
+            memset(accum, 0, sizeof(accum));
+        }
+
+        if (surfacing) {
+            advance_window(window, sample, kInputSize);
+            surface_count++;
+            window_pos++;
+
+            // Window full — run inference and accumulate
+            if (window_pos == WINDOW_SIZE) {
+                float result[OUTPUT_CHANNELS];
+                if (infer(p, window, kInputSize, kOutputSize, result))
+                    return 1;
+                for (int i = 0; i < OUTPUT_CHANNELS; i++)
+                    accum[i] += result[i];
+                window_count++;
+                window_pos = 0;
+            }
+
+            if (depth > dive_depth) {
+                // Falling edge
+                surfacing = false;
+
+                if (window_count > 0 && surface_count >= min_samples) {
+                    float averaged[OUTPUT_CHANNELS];
+                    for (int i = 0; i < OUTPUT_CHANNELS; i++)
+                        averaged[i] = accum[i] / window_count;
+
+                    write_output(averaged, OUTPUT_CHANNELS);
+                    continue;
+                }
+            }
+        }
+
+        write_skip();
+    }
+
+    return 0;
+}
+
+int main(int argc, const char *argv[])
+{
+    const char *strategy_str = NULL;
+    int surface_depth = 0;
+    int dive_depth = -1;
+    int min_samples = -1;
+
+    // Parse args
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "--strategy") == 0 || strcmp(argv[i], "-s") == 0) && i + 1 < argc) {
+            strategy_str = argv[++i];
+        } else if ((strcmp(argv[i], "--surface-depth") == 0 || strcmp(argv[i], "-u") == 0) && i + 1 < argc) {
+            surface_depth = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "--dive-depth") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
+            dive_depth = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "--min-samples") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
+            min_samples = atoi(argv[++i]);
+        } else {
+            print_usage();
+            return 1;
+        }
+    }
+
+    if (!strategy_str || (strcmp(strategy_str, "start") != 0 && strcmp(strategy_str, "end") != 0
+    && strcmp(strategy_str, "bookend") != 0 && strcmp(strategy_str, "average") != 0)) {
+        print_usage();
+        fprintf(stderr, "Strategy must be one of: start, end, bookend, average.\n");
+        return 1;
+    }
+
+    if (dive_depth < 0) {
+        print_usage();
+        fprintf(stderr, "Dive depth must be >= 0.\n");
+        return 1;
+    }
+
+    if (min_samples < 0) {
+        min_samples = WINDOW_SIZE;
+    }
+
+    Pipeline p = pipeline_init();
+
+    if (strcmp(strategy_str, "start") == 0)
+        return run_start(&p, surface_depth, dive_depth, min_samples);
+    else if (strcmp(strategy_str, "end") == 0)
+        return run_end(&p, surface_depth, dive_depth, min_samples);
+    else if (strcmp(strategy_str, "bookend") == 0)
+        return run_bookend(&p, surface_depth, dive_depth, min_samples);
+    else
+        return run_average(&p, surface_depth, dive_depth, min_samples);
+}
