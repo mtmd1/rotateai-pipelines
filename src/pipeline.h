@@ -59,6 +59,8 @@ inline Pipeline pipeline_init() {
         exit(1);
     }
 
+    fprintf(stderr, "arena_used_bytes:%zu\n", interp.arena_used_bytes());
+
     TfLiteTensor* input = interp.input(0);
     TfLiteTensor* output = interp.output(0);
     if (!input || !output || !input->data.f || !output->data.f) {
